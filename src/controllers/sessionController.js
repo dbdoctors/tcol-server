@@ -6,12 +6,42 @@ const axios = require('axios');
 exports.submitSession = async (req, res) => {
     try {
         const { exerciseId, exerciseTitle, exerciseContent, exerciseDifficulty,
-            transcript, duration, type } = req.body;
+            transcript: clientTranscript, duration, type, audioBase64, audioFormat } = req.body;
+
+        let transcript = clientTranscript;
+
+        // If no transcript from client (Web Speech API unavailable), use Vosk on the server
+        if (!transcript && audioBase64) {
+            try {
+                const audioBuffer = Buffer.from(audioBase64, 'base64');
+                const vpResponse = await axios.post(
+                    `${process.env.VOICE_PROCESSOR_URL}/api/transcribe`,
+                    audioBuffer,
+                    {
+                        headers: {
+                            'Content-Type': 'application/octet-stream',
+                            'X-Audio-Format': audioFormat || 'webm'
+                        },
+                        timeout: 60000,
+                        maxBodyLength: 50 * 1024 * 1024,
+                        maxContentLength: 50 * 1024 * 1024
+                    }
+                );
+                transcript = vpResponse.data.transcript || '';
+                console.log(`Server-side transcription completed: "${transcript.substring(0, 80)}..."`);
+            } catch (transcribeError) {
+                console.error('Server-side transcription failed:', transcribeError.message);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Speech transcription failed. Please try again or use a supported browser.'
+                });
+            }
+        }
 
         if (!transcript || !duration) {
             return res.status(400).json({
                 success: false,
-                message: 'Transcript and duration are required.'
+                message: 'Transcript and duration are required. If speech was not detected, please try again.'
             });
         }
 
