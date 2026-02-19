@@ -136,6 +136,179 @@ exports.submitSession = async (req, res) => {
     }
 };
 
+// Submit a session with audio file upload (multipart/form-data)
+// Progressive save: transcript saved first, then analysis result saved.
+exports.submitAudioSession = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                message: 'No audio file uploaded. Please record audio and try again.'
+            });
+        }
+
+        const { exerciseId, exerciseTitle, exerciseContent, exerciseDifficulty,
+            duration, type } = req.body;
+
+        const parsedDuration = parseInt(duration, 10);
+        if (!parsedDuration) {
+            return res.status(400).json({
+                success: false,
+                message: 'Duration is required.'
+            });
+        }
+
+        // Determine audio format from mimetype
+        const mimetype = req.file.mimetype || '';
+        let audioFormat = 'webm';
+        if (mimetype.includes('ogg')) audioFormat = 'ogg';
+        else if (mimetype.includes('mp3') || mimetype.includes('mpeg')) audioFormat = 'mp3';
+        else if (mimetype.includes('wav')) audioFormat = 'wav';
+
+        // ──────────────────────────────────────────────
+        // Step 1: Transcribe audio via voice-processor (Vosk)
+        // ──────────────────────────────────────────────
+        let transcript;
+        try {
+            const vpResponse = await axios.post(
+                `${process.env.VOICE_PROCESSOR_URL}/api/transcribe`,
+                req.file.buffer,
+                {
+                    headers: {
+                        'Content-Type': 'application/octet-stream',
+                        'X-Audio-Format': audioFormat
+                    },
+                    timeout: 60000,
+                    maxBodyLength: 50 * 1024 * 1024,
+                    maxContentLength: 50 * 1024 * 1024
+                }
+            );
+            transcript = vpResponse.data.transcript || '';
+            console.log(`🎤 Vosk transcription completed: "${transcript.substring(0, 80)}${transcript.length > 80 ? '...' : ''}"`);
+        } catch (transcribeError) {
+            console.error('Vosk transcription failed:', transcribeError.message);
+            return res.status(500).json({
+                success: false,
+                message: 'Speech transcription failed. The transcription server may be unavailable. Please try again later.'
+            });
+        }
+
+        if (!transcript.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: 'No speech was detected in the audio. Please try recording again and speak clearly.'
+            });
+        }
+
+        // ──────────────────────────────────────────────
+        // Step 2: Save session with transcript (status: 'transcribed')
+        // ──────────────────────────────────────────────
+        const session = await Session.create({
+            user: req.user._id,
+            type: type || 'guided-reading',
+            exercise: {
+                title: exerciseTitle || '',
+                content: exerciseContent || '',
+                difficulty: exerciseDifficulty || 'beginner',
+                wordCount: exerciseContent ? exerciseContent.split(/\s+/).length : 0
+            },
+            recording: {
+                duration: parsedDuration,
+                transcript
+            },
+            status: 'transcribed'
+        });
+
+        console.log(`💾 Session ${session._id} saved with transcript (status: transcribed)`);
+
+        // ──────────────────────────────────────────────
+        // Step 3: Analyze transcript via voice-processor (AI / heuristic)
+        // ──────────────────────────────────────────────
+        let feedback;
+        let analysisStatus = 'analyzed';
+        try {
+            const vpResponse = await axios.post(
+                `${process.env.VOICE_PROCESSOR_URL}/api/analyze`,
+                {
+                    transcript,
+                    originalText: exerciseContent || '',
+                    type: type || 'guided-reading',
+                    duration: parsedDuration
+                },
+                { timeout: 30000 }
+            );
+            feedback = vpResponse.data.feedback;
+        } catch (vpError) {
+            console.error('AI analysis failed, using fallback:', vpError.message);
+            feedback = generateFallbackFeedback(transcript, parsedDuration);
+            analysisStatus = 'failed';
+        }
+
+        // ──────────────────────────────────────────────
+        // Step 4: Update session with feedback (status: 'analyzed' or 'failed')
+        // ──────────────────────────────────────────────
+        session.feedback = feedback;
+        session.status = analysisStatus;
+        await session.save();
+
+        console.log(`💾 Session ${session._id} updated with feedback (status: ${analysisStatus})`);
+
+        // ──────────────────────────────────────────────
+        // Step 5: Update user stats
+        // ──────────────────────────────────────────────
+        const user = await User.findById(req.user._id);
+        const allSessions = await Session.find({ user: req.user._id });
+
+        const totalScore = allSessions.reduce((sum, s) => sum + (s.feedback?.overallScore || 0), 0);
+        user.stats.totalSessions = allSessions.length;
+        user.stats.averageScore = Math.round(totalScore / allSessions.length);
+
+        // Update streak
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const lastSession = user.stats.lastSessionDate ? new Date(user.stats.lastSessionDate) : null;
+
+        if (lastSession) {
+            lastSession.setHours(0, 0, 0, 0);
+            const dayDiff = (today - lastSession) / (1000 * 60 * 60 * 24);
+
+            if (dayDiff === 1) {
+                user.stats.currentStreak += 1;
+            } else if (dayDiff > 1) {
+                user.stats.currentStreak = 1;
+            }
+        } else {
+            user.stats.currentStreak = 1;
+        }
+
+        if (user.stats.currentStreak > user.stats.longestStreak) {
+            user.stats.longestStreak = user.stats.currentStreak;
+        }
+
+        user.stats.lastSessionDate = new Date();
+
+        // Check for impromptu unlock
+        const justUnlocked = !user.impromptuUnlocked && user.checkUnlock();
+
+        await user.save();
+
+        res.status(201).json({
+            success: true,
+            transcript,  // Return transcript so the frontend can display it
+            session,
+            stats: user.stats,
+            impromptuUnlocked: user.impromptuUnlocked,
+            justUnlocked
+        });
+    } catch (error) {
+        console.error('Submit audio session error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
 // Get user's session history
 exports.getSessions = async (req, res) => {
     try {

@@ -25,6 +25,11 @@ const sessionSchema = new mongoose.Schema({
         duration: Number, // in seconds
         transcript: String
     },
+    status: {
+        type: String,
+        enum: ['transcribed', 'analyzed', 'failed'],
+        default: 'transcribed'
+    },
     feedback: {
         overallScore: { type: Number, min: 0, max: 100 },
         clarity: { type: Number, min: 0, max: 100 },
